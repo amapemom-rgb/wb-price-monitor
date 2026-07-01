@@ -1,0 +1,10 @@
+# clasp / локальная синхронизация Apps Script
+.clasp.json
+.clasprc.json
+node_modules/
+
+# Секреты — реальные значения живут в Script Properties, не в репо
+*.env
+.env
+credentials*.json
+secrets*.json

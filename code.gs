@@ -90,8 +90,9 @@ function checkPrices() {
       var delta = Math.round((newPrice - oldPrice) * 100) / 100;
       var pct = Math.round((delta / oldPrice) * 1000) / 10;
       rows[j][6] = "'" + (delta > 0 ? '+' : '') + delta + ' ₽ (' + (pct > 0 ? '+' : '') + pct + '%)';
+      var comment = String(rows[j][0]).trim();
       changes.push({
-        nm: artikul, name: info.name,
+        nm: artikul, name: info.name, comment: comment,
         oldPrice: oldPrice, newPrice: newPrice, delta: delta, pct: pct
       });
     } else if (oldPrice === 0) {
@@ -214,7 +215,11 @@ function buildMessage(changes) {
   for (var i = 0; i < changes.length; i++) {
     var ch = changes[i];
     var arrow = ch.delta > 0 ? '🔺' : '🔻';
-    lines.push(arrow + ' ' + (ch.name || ch.nm) + ' (арт. ' + ch.nm + ')');
+    var title = ch.comment || ch.name || ch.nm;
+    lines.push(arrow + ' ' + title + ' (арт. ' + ch.nm + ')');
+    if (ch.comment && ch.name) {
+      lines.push('   ' + ch.name);
+    }
     lines.push('   ' + ch.oldPrice + ' ₽ → ' + ch.newPrice + ' ₽  (' +
                (ch.pct > 0 ? '+' : '') + ch.pct + '%)');
   }

@@ -38,7 +38,7 @@ function checkPrices() {
   var lastRow = sheet.getLastRow();
   if (lastRow < 2) return; // только заголовок, данных нет
 
-  var range = sheet.getRange(2, 1, lastRow - 1, 8);
+  var range = sheet.getRange(2, 1, lastRow - 1, 11);
   var rows = range.getValues();
 
   // Собираем список артикулов
@@ -49,7 +49,10 @@ function checkPrices() {
   }
   if (nmList.length === 0) return;
 
-  // Запрашиваем цены батчами
+  // Запрашиваем цены из официального API (в изолированном блоке try/catch)
+  var officialPrices = fetchOfficialWbPrices();
+
+  // Запрашиваем публичные цены батчами
   var prices = {}; // nm -> {price, name}
   for (var c = 0; c < nmList.length; c += CHUNK_SIZE) {
     var chunk = nmList.slice(c, c + CHUNK_SIZE);
@@ -78,6 +81,13 @@ function checkPrices() {
       continue;
     }
 
+    // Автоматическое определение меток
+    if (officialPrices) {
+      var isOurProduct = officialPrices.hasOwnProperty(artikul);
+      rows[j][2] = isOurProduct ? 'моё' : 'конкурент';
+    }
+    var isOur = (rows[j][2] === 'моё');
+
     var oldPrice = Number(rows[j][5]) || 0; // тек.цена прошлого прогона
     var newPrice = info.price;
 
@@ -86,6 +96,32 @@ function checkPrices() {
     rows[j][5] = newPrice;        // Текущая цена
     rows[j][7] = formatDate(now); // Обновлено
 
+    // Заполнение ЛК-цен и расчет СПП для наших товаров
+    if (isOur) {
+      if (officialPrices && officialPrices.hasOwnProperty(artikul)) {
+        rows[j][8] = officialPrices[artikul];
+      }
+      var priceLk = Number(rows[j][8]) || 0;
+      var tekPrice = newPrice;
+      
+      if (priceLk <= 0 || tekPrice <= 0) {
+        rows[j][9] = 'уточняется';
+      } else {
+        var spp = (priceLk - tekPrice) / priceLk * 100;
+        spp = Math.round(spp * 10) / 10;
+        if (spp < 0 || spp > 95) {
+          rows[j][9] = 'уточняется';
+        } else {
+          rows[j][10] = rows[j][9] || '';
+          rows[j][9] = spp;
+        }
+      }
+    } else {
+      rows[j][8] = '';
+      rows[j][9] = '';
+      rows[j][10] = '';
+    }
+
     if (oldPrice > 0 && newPrice !== oldPrice) {
       var delta = Math.round((newPrice - oldPrice) * 100) / 100;
       var pct = Math.round((delta / oldPrice) * 1000) / 10;
@@ -93,12 +129,89 @@ function checkPrices() {
       var comment = String(rows[j][0]).trim();
       changes.push({
         nm: artikul, name: info.name, comment: comment,
-        oldPrice: oldPrice, newPrice: newPrice, delta: delta, pct: pct
+        oldPrice: oldPrice, newPrice: newPrice, delta: delta, pct: pct,
+        isOur: isOur, spp: rows[j][9], prevSpp: rows[j][10]
       });
     } else if (oldPrice === 0) {
       rows[j][6] = 'базовая'; // первый прогон — фиксируем базу, алерт не шлём
     } else {
       rows[j][6] = 'без изменений';
+    }
+  }
+
+  // Реконсиляция (согласование цен) для наших товаров перед отправкой
+  var hasOurChange = false;
+  var ourChangedNms = [];
+  for (var i = 0; i < changes.length; i++) {
+    if (changes[i].isOur) {
+      hasOurChange = true;
+      ourChangedNms.push(changes[i].nm);
+    }
+  }
+
+  if (hasOurChange) {
+    Logger.log('Обнаружено изменение по нашим товарам. Задержка 60 сек перед перепроверкой...');
+    Utilities.sleep(60000);
+    
+    // Перезапрашиваем официальные и публичные цены
+    var officialPrices2 = fetchOfficialWbPrices();
+    var prices2 = {};
+    for (var c = 0; c < ourChangedNms.length; c += CHUNK_SIZE) {
+      var chunk = ourChangedNms.slice(c, c + CHUNK_SIZE);
+      var data = fetchWbPrices(chunk);
+      for (var key in data) prices2[key] = data[key];
+      Utilities.sleep(REQUEST_DELAY_MS);
+    }
+    
+    // Обновляем измененные строки
+    for (var i = 0; i < changes.length; i++) {
+      var ch = changes[i];
+      if (ch.isOur) {
+        var artikul = ch.nm;
+        var rowIndex = -1;
+        for (var j = 0; j < rows.length; j++) {
+          if (String(rows[j][1]).trim() === artikul) {
+            rowIndex = j;
+            break;
+          }
+        }
+        
+        if (rowIndex !== -1) {
+          var info2 = prices2[artikul];
+          if (info2) {
+            ch.newPrice = info2.price;
+            rows[rowIndex][5] = info2.price; // Текущая цена
+            
+            var oldPrice = ch.oldPrice;
+            var newPrice = info2.price;
+            var delta = Math.round((newPrice - oldPrice) * 100) / 100;
+            var pct = Math.round((delta / oldPrice) * 1000) / 10;
+            rows[rowIndex][6] = "'" + (delta > 0 ? '+' : '') + delta + ' ₽ (' + (pct > 0 ? '+' : '') + pct + '%)';
+            ch.delta = delta;
+            ch.pct = pct;
+          }
+          
+          if (officialPrices2 && officialPrices2.hasOwnProperty(artikul)) {
+            rows[rowIndex][8] = officialPrices2[artikul]; // Цена ЛК
+          }
+          
+          var priceLk = Number(rows[rowIndex][8]) || 0;
+          var tekPrice = Number(rows[rowIndex][5]) || 0;
+          
+          if (priceLk <= 0 || tekPrice <= 0) {
+            rows[rowIndex][9] = 'уточняется';
+          } else {
+            var spp = (priceLk - tekPrice) / priceLk * 100;
+            spp = Math.round(spp * 10) / 10;
+            if (spp < 0 || spp > 95) {
+              rows[rowIndex][9] = 'уточняется';
+            } else {
+              rows[rowIndex][9] = spp;
+            }
+          }
+          ch.spp = rows[rowIndex][9];
+        }
+      }
     }
   }
 
@@ -173,6 +286,56 @@ function fetchWbPrices(nmArray) {
 }
 
 /**
+ * Запрос цен у официального API WB категории «Цены и скидки».
+ * Возвращает объект nmID -> discountedPrice.
+ */
+function fetchOfficialWbPrices() {
+  var apiKey = PropertiesService.getScriptProperties().getProperty('WB_API_KEY');
+  if (!apiKey || apiKey === 'YOUR_WB_API_KEY_HERE') {
+    Logger.log('Официальный токен WB_API_KEY не задан или содержит плейсхолдер.');
+    return null;
+  }
+  
+  var url = 'https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter?limit=1000&offset=0';
+  try {
+    var response = UrlFetchApp.fetch(url, {
+      method: 'get',
+      headers: {
+        'Authorization': apiKey
+      },
+      muteHttpExceptions: true
+    });
+    var code = response.getResponseCode();
+    if (code !== 200) {
+      Logger.log('Официальный API вернул код ' + code + ': ' + response.getContentText());
+      return null;
+    }
+    var json = JSON.parse(response.getContentText());
+    if (!json.data || !json.data.listGoods) {
+      Logger.log('Официальный API вернул неожиданный формат ответа.');
+      return null;
+    }
+    
+    var goods = json.data.listGoods;
+    var result = {};
+    for (var i = 0; i < goods.length; i++) {
+      var item = goods[i];
+      var nmId = String(item.nmID);
+      var price = 0;
+      if (item.sizes && item.sizes.length > 0) {
+        price = Number(item.sizes[0].discountedPrice) || 0;
+      }
+      result[nmId] = price;
+    }
+    return result;
+  } catch (e) {
+    Logger.log('Изолированная ошибка при обращении к официальному API: ' + e.message);
+    return null;
+  }
+}
+
+
+/**
  * Достаёт цену в копейках, устойчиво к смене формата ответа WB.
  * Новый формат: sizes[0].price.product / total / basic.
  * Старый формат: salePriceU / priceU.
@@ -224,6 +387,15 @@ function buildMessage(changes) {
     }
     lines.push('   ' + ch.oldPrice + ' ₽ → ' + ch.newPrice + ' ₽  (' +
                (ch.pct > 0 ? '+' : '') + ch.pct + '%)');
+    if (ch.isOur && ch.spp !== 'уточняется' && ch.spp !== '' && ch.spp !== undefined) {
+      var prevSppValid = (ch.prevSpp !== 'уточняется' && ch.prevSpp !== '' && ch.prevSpp !== undefined);
+      if (prevSppValid && ch.prevSpp !== ch.spp) {
+        var arrowSpp = Number(ch.spp) > Number(ch.prevSpp) ? '▲' : '▼';
+        lines.push('   СПП: ' + ch.prevSpp + '% → ' + ch.spp + '% (' + arrowSpp + ')');
+      } else {
+        lines.push('   СПП: ' + ch.spp + '%');
+      }
+    }
   }
   return lines.join('\n');
 }
@@ -276,6 +448,21 @@ function testFetch() {
   Logger.log('Running testFetch');
 }
 
+function testOfficialApi() {
+  var apiKey = PropertiesService.getScriptProperties().getProperty('WB_API_KEY');
+  Logger.log('Using API Key: ' + (apiKey ? apiKey.substring(0, 10) + '...' : 'null'));
+  var url = 'https://discounts-prices-api.wildberries.ru/api/v2/list/goods/filter?limit=10&offset=0';
+  var response = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: {
+      'Authorization': apiKey
+    },
+    muteHttpExceptions: true
+  });
+  Logger.log('Response code: ' + response.getResponseCode());
+  Logger.log('Response content: ' + response.getContentText().substring(0, 1000));
+}
+
 function testTelegram() {
   sendTelegram('✅ WB Price Monitor: связь с Telegram работает.');
 }
@@ -290,9 +477,9 @@ function initSheet() {
     sheet = ss.getSheets()[0];
     sheet.setName(SHEET_PRODUCTS);
   }
-  // Записываем заголовки в первую строку (A1:H1)
-  sheet.getRange(1, 1, 1, 8).setValues([[
-    'Комментарии', 'Артикул', 'Метка', 'Название', 'Пред.цена', 'Тек.цена', 'Изменение', 'Обновлено'
+  // Записываем заголовки в первую строку (A1:K1)
+  sheet.getRange(1, 1, 1, 11).setValues([[
+    'Комментарии', 'Артикул', 'Метка', 'Название', 'Пред.цена', 'Тек.цена', 'Изменение', 'Обновлено', 'Цена ЛК', 'СПП %', 'Пред. СПП %'
   ]]);
   
   // Добавляем тестовый артикул, если таблица пуста
